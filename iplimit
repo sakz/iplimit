@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+readonly PROGRAM_NAME="iplimit"
+readonly VERSION="1.0.0"
+readonly CONFIG_FILE="${IPLIMIT_CONFIG_FILE:-/etc/iplimit.conf}"
+readonly STATE_DIR="${IPLIMIT_STATE_DIR:-/run/iplimit}"
+readonly OWNER_FILE="$STATE_DIR/owner.env"
+readonly CLIENTS_FILE="$STATE_DIR/clients.tsv"
+readonly SERVICE_NAME="iplimit.service"
+readonly REDIRECT_PREF="49152"
+
+RATE_MBIT="20"
+INTERFACE="auto"
+IFB_NAME="ifb-iplimit"
+POLL_INTERVAL="2"
+CLIENT_TTL="300"
+UNSHAPED_RATE_MBIT="100000"
+EXCLUDE_IPS=""
+
+log() {
+    printf '[%s] %s\n' "$PROGRAM_NAME" "$*"
+}
+
+warn() {
+    printf '[%s] WARNING: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+die() {
+    printf '[%s] ERROR: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+is_valid_rate() {
+    local value=${1:-}
+    [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v value="$value" 'BEGIN { exit !(value > 0) }'
+}
+
+is_positive_integer() {
+    [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_ip_address() {
+    local ip=${1:-}
+    local part
+
+    if [[ "$ip" == *:* ]]; then
+        [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ && "$ip" != *:::* ]]
+        return
+    fi
+
+    [[ "$ip" =~ ^[0-9]+([.][0-9]+){3}$ ]] || return 1
+    local old_ifs=$IFS
+    IFS=.
+    # shellcheck disable=SC2206
+    local parts=($ip)
+    IFS=$old_ifs
+    [[ ${#parts[@]} -eq 4 ]] || return 1
+    for part in "${parts[@]}"; do
+        [[ "$part" =~ ^[0-9]+$ ]] || return 1
+        ((10#$part <= 255)) || return 1
+    done
+}
+
+extract_clients() {
+    local local_addresses=${1:-}
+    awk -v addresses="$local_addresses" '
+        BEGIN {
+            count = split(addresses, values, /[[:space:]]+/)
+            for (i = 1; i <= count; i++) {
+                if (values[i] != "") local_ip[values[i]] = 1
+            }
+        }
+        $1 == "tcp" || $1 == "udp" {
+            source = ""
+            destination = ""
+            for (i = 1; i <= NF; i++) {
+                if (source == "" && $i ~ /^src=/) {
+                    source = substr($i, 5)
+                } else if (destination == "" && $i ~ /^dst=/) {
+                    destination = substr($i, 5)
+                }
+                if (source != "" && destination != "") break
+            }
+            if (source != "" && local_ip[destination] && !local_ip[source]) print source
+        }
+    '
+}
+
+filter_spec() {
+    local direction=${1:-}
+    local ip=${2:-}
+    local protocol key suffix
+
+    is_ip_address "$ip" || return 1
+    case "$direction" in
+        download) key="dst_ip" ;;
+        upload) key="src_ip" ;;
+        *) return 1 ;;
+    esac
+
+    if [[ "$ip" == *:* ]]; then
+        protocol="ipv6"
+        suffix="128"
+    else
+        protocol="ip"
+        suffix="32"
+    fi
+    printf '%s|%s|%s/%s\n' "$protocol" "$key" "$ip" "$suffix"
+}
+
+usage() {
+    cat <<'EOF'
+IPLimit - Debian 12 per-client traffic shaping
+
+Usage:
+  iplimit                         Open the interactive menu
+  iplimit start [Mbps] [iface]    Start or update shaping (defaults: 20, auto)
+  iplimit set <Mbps>              Change the per-client limit and restart
+  iplimit status                  Show service, qdisc, and configuration status
+  iplimit clients                 Show discovered client IPs and class IDs
+  iplimit stop                    Stop shaping and remove owned tc/IFB state
+  iplimit help                    Show this help
+  iplimit version                 Show the installed version
+
+Examples:
+  sudo iplimit start 20
+  sudo iplimit start 12.5 eth0
+  sudo iplimit set 50
+  sudo iplimit status
+
+The limit is independent for every directly connected client IP and applies to
+both TCP and UDP, upload and download. Unmatched traffic uses an unshaped class.
+EOF
+}
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # This is a root-managed file containing only simple variable assignments.
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE"
+    fi
+}
+
+validate_config() {
+    is_valid_rate "$RATE_MBIT" || die "RATE_MBIT must be a positive number, got: $RATE_MBIT"
+    is_positive_integer "$POLL_INTERVAL" || die "POLL_INTERVAL must be a positive integer"
+    is_positive_integer "$CLIENT_TTL" || die "CLIENT_TTL must be a positive integer"
+    is_valid_rate "$UNSHAPED_RATE_MBIT" || die "UNSHAPED_RATE_MBIT must be a positive number"
+    [[ "$INTERFACE" == "auto" || "$INTERFACE" =~ ^[a-zA-Z0-9_.:-]+$ ]] || die "Invalid interface name: $INTERFACE"
+    [[ "$IFB_NAME" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "Invalid IFB name: $IFB_NAME"
+    [[ "$INTERFACE" == "auto" || ${#INTERFACE} -le 15 ]] || die "Interface names are limited to 15 characters: $INTERFACE"
+    [[ ${#IFB_NAME} -le 15 ]] || die "IFB names are limited to 15 characters: $IFB_NAME"
+
+    local ip
+    for ip in $EXCLUDE_IPS; do
+        is_ip_address "$ip" || die "Invalid address in EXCLUDE_IPS: $ip"
+    done
+}
+
+require_root() {
+    [[ $(id -u) -eq 0 ]] || die "This command requires root; run it with sudo"
+}
+
+require_commands() {
+    local command_name
+    for command_name in ip tc conntrack modprobe systemctl awk sort; do
+        command -v "$command_name" >/dev/null 2>&1 || die "Missing dependency: $command_name (rerun install.sh)"
+    done
+}
+
+detect_interface() {
+    local detected
+    if [[ "$INTERFACE" != "auto" ]]; then
+        ip link show dev "$INTERFACE" >/dev/null 2>&1 || die "Interface does not exist: $INTERFACE"
+        printf '%s\n' "$INTERFACE"
+        return
+    fi
+
+    detected=$(ip -4 route show default 2>/dev/null | awk '/^default/ { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+    if [[ -z "$detected" ]]; then
+        detected=$(ip -6 route show default 2>/dev/null | awk '/^default/ { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+    fi
+    [[ -n "$detected" ]] || die "Could not detect the default network interface; pass it to: iplimit start <Mbps> <iface>"
+    printf '%s\n' "$detected"
+}
+
+save_config() {
+    local target_dir tmp
+    target_dir=$(dirname "$CONFIG_FILE")
+    mkdir -p "$target_dir"
+    tmp=$(mktemp "$target_dir/.iplimit.conf.XXXXXX")
+    chmod 600 "$tmp"
+    {
+        printf '# Managed by iplimit. Edit values, then run: sudo iplimit start\n'
+        printf 'RATE_MBIT="%s"\n' "$RATE_MBIT"
+        printf 'INTERFACE="%s"\n' "$INTERFACE"
+        printf 'IFB_NAME="%s"\n' "$IFB_NAME"
+        printf 'POLL_INTERVAL="%s"\n' "$POLL_INTERVAL"
+        printf 'CLIENT_TTL="%s"\n' "$CLIENT_TTL"
+        printf 'UNSHAPED_RATE_MBIT="%s"\n' "$UNSHAPED_RATE_MBIT"
+        printf 'EXCLUDE_IPS="%s"\n' "$EXCLUDE_IPS"
+    } >"$tmp"
+    mv -f "$tmp" "$CONFIG_FILE"
+}
+
+is_excluded() {
+    local candidate=$1
+    local excluded
+    for excluded in $EXCLUDE_IPS; do
+        [[ "$candidate" == "$excluded" ]] && return 0
+    done
+    return 1
+}
+
+root_qdisc_kind() {
+    local device=$1
+    tc qdisc show dev "$device" 2>/dev/null | awk '$0 ~ / root / { print $2; exit }'
+}
+
+owner_value() {
+    local key=$1
+    [[ -f "$OWNER_FILE" ]] || return 1
+    awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$OWNER_FILE"
+}
+
+assert_safe_root_qdisc() {
+    local device=$1
+    local kind owner_interface
+    kind=$(root_qdisc_kind "$device")
+
+    case "$kind" in
+        ""|noqueue|mq|fq|fq_codel|pfifo_fast) return 0 ;;
+        htb)
+            owner_interface=$(owner_value INTERFACE 2>/dev/null || true)
+            [[ "$owner_interface" == "$device" ]] && return 0
+            ;;
+    esac
+
+    die "Refusing to replace existing root qdisc '$kind' on $device. Remove or migrate that tc configuration first."
+}
+
+write_owner_file() {
+    local device=$1
+    local created_clsact=$2
+    local tmp="$OWNER_FILE.tmp.$$"
+    {
+        printf 'INTERFACE=%s\n' "$device"
+        printf 'IFB_NAME=%s\n' "$IFB_NAME"
+        printf 'CREATED_CLSACT=%s\n' "$created_clsact"
+    } >"$tmp"
+    mv -f "$tmp" "$OWNER_FILE"
+}
+
+setup_network() {
+    local device=$1
+    local created_clsact=0
+
+    mkdir -p "$STATE_DIR"
+    assert_safe_root_qdisc "$device"
+
+    if ip link show dev "$IFB_NAME" >/dev/null 2>&1; then
+        local owned_ifb
+        owned_ifb=$(owner_value IFB_NAME 2>/dev/null || true)
+        [[ "$owned_ifb" == "$IFB_NAME" ]] || die "IFB device already exists and is not owned by IPLimit: $IFB_NAME"
+    else
+        modprobe ifb 2>/dev/null || true
+        ip link add "$IFB_NAME" type ifb
+    fi
+    ip link set dev "$IFB_NAME" up
+    write_owner_file "$device" "0"
+
+    if ! tc qdisc show dev "$device" | grep -q '^qdisc clsact '; then
+        tc qdisc add dev "$device" clsact
+        created_clsact=1
+    else
+        created_clsact=$(owner_value CREATED_CLSACT 2>/dev/null || printf '0')
+    fi
+
+    write_owner_file "$device" "$created_clsact"
+
+    tc filter replace dev "$device" ingress pref "$REDIRECT_PREF" protocol all \
+        matchall action mirred egress redirect dev "$IFB_NAME"
+
+    tc qdisc replace dev "$device" root handle 1: htb default 1
+    tc class replace dev "$device" parent 1: classid 1:1 htb \
+        rate "${UNSHAPED_RATE_MBIT}mbit" ceil "${UNSHAPED_RATE_MBIT}mbit" quantum 15140
+    tc qdisc replace dev "$device" parent 1:1 handle 2: fq_codel
+
+    tc qdisc replace dev "$IFB_NAME" root handle 1: htb default 1
+    tc class replace dev "$IFB_NAME" parent 1: classid 1:1 htb \
+        rate "${UNSHAPED_RATE_MBIT}mbit" ceil "${UNSHAPED_RATE_MBIT}mbit" quantum 15140
+    tc qdisc replace dev "$IFB_NAME" parent 1:1 handle 2: fq_codel
+}
+
+cleanup_network() {
+    local device=${1:-}
+    local owned_device owned_ifb created_clsact
+
+    if [[ -z "$device" ]]; then
+        owned_device=$(owner_value INTERFACE 2>/dev/null || true)
+        device=$owned_device
+    fi
+    owned_ifb=$(owner_value IFB_NAME 2>/dev/null || printf '%s' "$IFB_NAME")
+    created_clsact=$(owner_value CREATED_CLSACT 2>/dev/null || printf '0')
+
+    if [[ -n "$device" ]] && ip link show dev "$device" >/dev/null 2>&1; then
+        tc filter del dev "$device" ingress pref "$REDIRECT_PREF" 2>/dev/null || true
+        if [[ $(root_qdisc_kind "$device") == "htb" ]]; then
+            tc qdisc del dev "$device" root 2>/dev/null || true
+        fi
+        if [[ "$created_clsact" == "1" ]] && ! tc filter show dev "$device" ingress 2>/dev/null | grep -q .; then
+            tc qdisc del dev "$device" clsact 2>/dev/null || true
+        fi
+    fi
+
+    if [[ -n "$owned_ifb" ]] && ip link show dev "$owned_ifb" >/dev/null 2>&1; then
+        tc qdisc del dev "$owned_ifb" root 2>/dev/null || true
+        ip link set dev "$owned_ifb" down 2>/dev/null || true
+        ip link delete "$owned_ifb" type ifb 2>/dev/null || true
+    fi
+
+    rm -f "$OWNER_FILE" "$CLIENTS_FILE"
+    rmdir "$STATE_DIR" 2>/dev/null || true
+}
+
+local_addresses() {
+    local device=$1
+    ip -o addr show dev "$device" scope global | awk '{ address=$4; sub(/\/.*/, "", address); print address }' | paste -sd ' ' -
+}
+
+list_conntrack_clients() {
+    local addresses=$1
+    {
+        conntrack -L -f ipv4 -o extended 2>/dev/null || true
+        conntrack -L -f ipv6 -o extended 2>/dev/null || true
+    } | extract_clients "$addresses" | sort -u
+}
+
+add_client_class() {
+    local device=$1
+    local ip=$2
+    local class_num=$3
+    local class_hex protocol download_key download_cidr upload_key upload_cidr
+    local download_spec upload_spec
+
+    class_hex=$(printf '%x' "$class_num")
+    download_spec=$(filter_spec download "$ip")
+    upload_spec=$(filter_spec upload "$ip")
+    IFS='|' read -r protocol download_key download_cidr <<<"$download_spec"
+    IFS='|' read -r _ upload_key upload_cidr <<<"$upload_spec"
+
+    if ! tc class add dev "$device" parent 1: classid "1:$class_hex" htb \
+        rate "${RATE_MBIT}mbit" ceil "${RATE_MBIT}mbit" quantum 1514; then
+        return 1
+    fi
+    tc qdisc add dev "$device" parent "1:$class_hex" handle "$class_hex:" fq_codel || return 1
+    tc filter add dev "$device" parent 1: pref "$class_num" protocol "$protocol" flower \
+        "$download_key" "$download_cidr" classid "1:$class_hex" || return 1
+
+    tc class add dev "$IFB_NAME" parent 1: classid "1:$class_hex" htb \
+        rate "${RATE_MBIT}mbit" ceil "${RATE_MBIT}mbit" quantum 1514 || return 1
+    tc qdisc add dev "$IFB_NAME" parent "1:$class_hex" handle "$class_hex:" fq_codel || return 1
+    tc filter add dev "$IFB_NAME" parent 1: pref "$class_num" protocol "$protocol" flower \
+        "$upload_key" "$upload_cidr" classid "1:$class_hex" || return 1
+}
+
+remove_client_class() {
+    local device=$1
+    local class_num=$2
+    local class_hex
+    class_hex=$(printf '%x' "$class_num")
+
+    tc filter del dev "$device" parent 1: pref "$class_num" 2>/dev/null || true
+    tc qdisc del dev "$device" parent "1:$class_hex" 2>/dev/null || true
+    tc class del dev "$device" classid "1:$class_hex" 2>/dev/null || true
+    tc filter del dev "$IFB_NAME" parent 1: pref "$class_num" 2>/dev/null || true
+    tc qdisc del dev "$IFB_NAME" parent "1:$class_hex" 2>/dev/null || true
+    tc class del dev "$IFB_NAME" classid "1:$class_hex" 2>/dev/null || true
+}
+
+daemon_main() {
+    require_root
+    require_commands
+    load_config
+    validate_config
+
+    local device addresses now ip candidate class_num tmp
+    local shutdown_done=0
+    device=$(detect_interface)
+    addresses=$(local_addresses "$device")
+    [[ -n "$addresses" ]] || die "No global IP address found on interface: $device"
+
+    daemon_shutdown() {
+        [[ "$shutdown_done" == "1" ]] && return
+        shutdown_done=1
+        trap - EXIT INT TERM
+        cleanup_network "$device"
+    }
+    trap 'daemon_shutdown; exit 0' INT TERM
+    trap 'daemon_shutdown' EXIT
+
+    setup_network "$device"
+
+    # These maps live only for one daemon generation; setup_network rebuilds tc state.
+    declare -A ip_class=()
+    declare -A class_ip=()
+    declare -A last_seen=()
+
+    log "active on $device: ${RATE_MBIT} Mbps per client in each direction"
+
+    while true; do
+        now=$(date +%s)
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] || continue
+            is_excluded "$ip" && continue
+            last_seen["$ip"]=$now
+            if [[ -z ${ip_class[$ip]+x} ]]; then
+                class_num=""
+                for ((candidate = 10; candidate <= 65000; candidate++)); do
+                    if [[ -z ${class_ip[$candidate]+x} ]]; then
+                        class_num=$candidate
+                        break
+                    fi
+                done
+                if [[ -z "$class_num" ]]; then
+                    warn "No free tc class ID for client $ip"
+                    continue
+                fi
+                if add_client_class "$device" "$ip" "$class_num"; then
+                    ip_class["$ip"]=$class_num
+                    class_ip["$class_num"]=$ip
+                    log "added client $ip as class 1:$(printf '%x' "$class_num")"
+                else
+                    warn "Could not add tc class for client $ip"
+                    remove_client_class "$device" "$class_num"
+                    unset 'last_seen[$ip]'
+                fi
+            fi
+        done < <(list_conntrack_clients "$addresses")
+
+        for ip in "${!ip_class[@]}"; do
+            if ((now - last_seen[$ip] > CLIENT_TTL)); then
+                class_num=${ip_class[$ip]}
+                remove_client_class "$device" "$class_num"
+                unset 'class_ip[$class_num]' 'ip_class[$ip]' 'last_seen[$ip]'
+                log "expired idle client $ip"
+            fi
+        done
+
+        tmp="$CLIENTS_FILE.tmp.$$"
+        {
+            printf 'IP\tCLASS\tLAST_SEEN_EPOCH\n'
+            for ip in "${!ip_class[@]}"; do
+                printf '%s\t1:%x\t%s\n' "$ip" "${ip_class[$ip]}" "${last_seen[$ip]}"
+            done | sort
+        } >"$tmp"
+        mv -f "$tmp" "$CLIENTS_FILE"
+        sleep "$POLL_INTERVAL"
+    done
+}
+
+start_limit() {
+    require_root
+    require_commands
+    load_config
+
+    if [[ -n ${1:-} ]]; then
+        RATE_MBIT=$1
+    fi
+    if [[ -n ${2:-} ]]; then
+        INTERFACE=$2
+    fi
+    [[ -z ${3:-} ]] || die "Too many arguments. Usage: iplimit start [Mbps] [iface]"
+    validate_config
+    save_config
+
+    systemctl daemon-reload
+    systemctl enable --now "$SERVICE_NAME"
+    systemctl is-active --quiet "$SERVICE_NAME" || die "Service failed to start; inspect: journalctl -u $SERVICE_NAME -n 100 --no-pager"
+    log "started: ${RATE_MBIT} Mbps per client (interface: $INTERFACE)"
+}
+
+set_limit() {
+    [[ -n ${1:-} && -z ${2:-} ]] || die "Usage: iplimit set <Mbps>"
+    start_limit "$1"
+}
+
+stop_limit() {
+    require_root
+    load_config
+    systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
+    cleanup_network
+    log "stopped; IPLimit-owned tc rules and IFB device were removed"
+}
+
+show_clients() {
+    require_root
+    if [[ -f "$CLIENTS_FILE" ]]; then
+        column -t -s $'\t' "$CLIENTS_FILE" 2>/dev/null || cat "$CLIENTS_FILE"
+    else
+        log "no active client table (the service may be stopped or no poll has completed)"
+    fi
+}
+
+show_status() {
+    require_root
+    load_config
+    validate_config
+    local device
+    device=$(detect_interface)
+
+    printf 'Service:   '
+    systemctl is-active "$SERVICE_NAME" 2>/dev/null || true
+    printf 'Enabled:   '
+    systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true
+    printf 'Interface: %s\n' "$device"
+    printf 'IFB:       %s\n' "$IFB_NAME"
+    printf 'Limit:     %s Mbps per client, per direction\n' "$RATE_MBIT"
+    printf 'Protocols: IPv4/IPv6, TCP/UDP\n'
+    printf 'Idle TTL:  %s seconds\n' "$CLIENT_TTL"
+
+    printf '\nRoot qdisc on %s:\n' "$device"
+    tc qdisc show dev "$device" 2>/dev/null || true
+    if ip link show dev "$IFB_NAME" >/dev/null 2>&1; then
+        printf '\nRoot qdisc on %s:\n' "$IFB_NAME"
+        tc qdisc show dev "$IFB_NAME" 2>/dev/null || true
+    fi
+    printf '\nClients:\n'
+    show_clients
+}
+
+interactive_menu() {
+    require_root
+    while true; do
+        cat <<'EOF'
+
+IPLimit
+  1) Start or change the per-client limit
+  2) Show status
+  3) Show active clients
+  4) Stop and clean up
+  5) Exit
+EOF
+        read -r -p "Choose [1-5]: " choice
+        case "$choice" in
+            1)
+                read -r -p "Per-client Mbps [20]: " rate
+                rate=${rate:-20}
+                read -r -p "Network interface [auto]: " iface
+                iface=${iface:-auto}
+                start_limit "$rate" "$iface"
+                ;;
+            2) show_status ;;
+            3) show_clients ;;
+            4) stop_limit ;;
+            5) return 0 ;;
+            *) warn "Choose a number from 1 to 5" ;;
+        esac
+    done
+}
+
+main() {
+    local command=${1:-}
+    if [[ $# -gt 0 ]]; then
+        shift
+    fi
+    case "$command" in
+        "") interactive_menu ;;
+        start) start_limit "$@" ;;
+        set) set_limit "$@" ;;
+        status) [[ $# -eq 0 ]] || die "Usage: iplimit status"; show_status ;;
+        clients) [[ $# -eq 0 ]] || die "Usage: iplimit clients"; show_clients ;;
+        stop|clean) [[ $# -eq 0 ]] || die "Usage: iplimit stop"; stop_limit ;;
+        help|-h|--help) usage ;;
+        version|-V|--version) printf '%s %s\n' "$PROGRAM_NAME" "$VERSION" ;;
+        daemon-internal) [[ $# -eq 0 ]] || die "Invalid daemon arguments"; daemon_main ;;
+        cleanup-internal) [[ $# -eq 0 ]] || die "Invalid cleanup arguments"; require_root; load_config; cleanup_network ;;
+        *) die "Unknown command: $command (run: iplimit help)" ;;
+    esac
+}
+
+if [[ ${IPLIMIT_LIBRARY_ONLY:-0} != "1" ]]; then
+    main "$@"
+fi

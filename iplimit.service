@@ -1,0 +1,16 @@
+[Unit]
+Description=IPLimit per-client traffic shaping
+Documentation=https://github.com/sakz/iplimit
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/iplimit daemon-internal
+ExecStopPost=/usr/local/bin/iplimit cleanup-internal
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
