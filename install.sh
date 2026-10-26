@@ -37,10 +37,10 @@ fetch_file() {
 install_dependencies() {
     [[ ${SKIP_DEPENDENCIES:-0} == "1" ]] && return
     command -v apt-get >/dev/null 2>&1 || die "This installer supports Debian/Ubuntu systems with apt-get"
-    log "installing dependencies (bash, iproute2, conntrack, kmod)"
+    log "installing dependencies (bash, iproute2, conntrack, kmod, systemd)"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y --no-install-recommends bash iproute2 conntrack kmod ca-certificates
+    apt-get install -y --no-install-recommends bash iproute2 conntrack kmod systemd ca-certificates
 }
 
 atomic_install() {

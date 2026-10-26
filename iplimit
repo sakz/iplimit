@@ -18,6 +18,7 @@ POLL_INTERVAL="2"
 CLIENT_TTL="300"
 UNSHAPED_RATE_MBIT="100000"
 EXCLUDE_IPS=""
+NETWORK_TOUCHED=0
 
 log() {
     printf '[%s] %s\n' "$PROGRAM_NAME" "$*"
@@ -41,14 +42,14 @@ is_positive_integer() {
     [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
 }
 
-is_ip_address() {
+is_valid_interface_name() {
+    local name=${1:-}
+    [[ "$name" =~ ^[a-zA-Z0-9_.:-]+$ && ${#name} -le 15 ]]
+}
+
+is_ipv4_address() {
     local ip=${1:-}
     local part
-
-    if [[ "$ip" == *:* ]]; then
-        [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ && "$ip" != *:::* ]]
-        return
-    fi
 
     [[ "$ip" =~ ^[0-9]+([.][0-9]+){3}$ ]] || return 1
     local old_ifs=$IFS
@@ -63,6 +64,69 @@ is_ip_address() {
     done
 }
 
+is_ipv6_address() {
+    local ip=${1:-}
+    local left right compressed=0 part index slots=0
+    local -a segments=()
+
+    [[ "$ip" == *:* && "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+    if [[ "$ip" == *::* ]]; then
+        compressed=1
+        left=${ip%%::*}
+        right=${ip#*::}
+        [[ "$right" != *::* ]] || return 1
+    else
+        [[ "$ip" != :* && "$ip" != *: ]] || return 1
+        left=$ip
+        right=""
+    fi
+
+    if [[ -n "$left" ]]; then
+        local old_ifs=$IFS
+        IFS=:
+        # shellcheck disable=SC2206
+        local left_parts=($left)
+        IFS=$old_ifs
+        segments+=("${left_parts[@]}")
+    fi
+    if [[ -n "$right" ]]; then
+        local old_ifs=$IFS
+        IFS=:
+        # shellcheck disable=SC2206
+        local right_parts=($right)
+        IFS=$old_ifs
+        segments+=("${right_parts[@]}")
+    fi
+
+    for ((index = 0; index < ${#segments[@]}; index++)); do
+        part=${segments[$index]}
+        [[ -n "$part" ]] || return 1
+        if [[ "$part" == *.* ]]; then
+            [[ $index -eq $((${#segments[@]} - 1)) ]] || return 1
+            is_ipv4_address "$part" || return 1
+            slots=$((slots + 2))
+        else
+            [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+            slots=$((slots + 1))
+        fi
+    done
+
+    if [[ "$compressed" == "1" ]]; then
+        ((slots < 8))
+    else
+        ((slots == 8))
+    fi
+}
+
+is_ip_address() {
+    local ip=${1:-}
+    if [[ "$ip" == *:* ]]; then
+        is_ipv6_address "$ip"
+    else
+        is_ipv4_address "$ip"
+    fi
+}
+
 extract_clients() {
     local local_addresses=${1:-}
     awk -v addresses="$local_addresses" '
@@ -72,7 +136,7 @@ extract_clients() {
                 if (values[i] != "") local_ip[values[i]] = 1
             }
         }
-        $1 == "tcp" || $1 == "udp" {
+        ($1 == "tcp" || $1 == "udp") || (($1 == "ipv4" || $1 == "ipv6") && ($3 == "tcp" || $3 == "udp")) {
             source = ""
             destination = ""
             for (i = 1; i <= NF; i++) {
@@ -148,10 +212,8 @@ validate_config() {
     is_positive_integer "$POLL_INTERVAL" || die "POLL_INTERVAL must be a positive integer"
     is_positive_integer "$CLIENT_TTL" || die "CLIENT_TTL must be a positive integer"
     is_valid_rate "$UNSHAPED_RATE_MBIT" || die "UNSHAPED_RATE_MBIT must be a positive number"
-    [[ "$INTERFACE" == "auto" || "$INTERFACE" =~ ^[a-zA-Z0-9_.:-]+$ ]] || die "Invalid interface name: $INTERFACE"
-    [[ "$IFB_NAME" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "Invalid IFB name: $IFB_NAME"
-    [[ "$INTERFACE" == "auto" || ${#INTERFACE} -le 15 ]] || die "Interface names are limited to 15 characters: $INTERFACE"
-    [[ ${#IFB_NAME} -le 15 ]] || die "IFB names are limited to 15 characters: $IFB_NAME"
+    [[ "$INTERFACE" == "auto" ]] || is_valid_interface_name "$INTERFACE" || die "Invalid interface name (maximum 15 characters): $INTERFACE"
+    is_valid_interface_name "$IFB_NAME" || die "Invalid IFB name (maximum 15 characters): $IFB_NAME"
 
     local ip
     for ip in $EXCLUDE_IPS; do
@@ -165,7 +227,7 @@ require_root() {
 
 require_commands() {
     local command_name
-    for command_name in ip tc conntrack modprobe systemctl awk sort; do
+    for command_name in ip tc conntrack modprobe systemctl systemd-notify awk sort; do
         command -v "$command_name" >/dev/null 2>&1 || die "Missing dependency: $command_name (rerun install.sh)"
     done
 }
@@ -214,9 +276,9 @@ is_excluded() {
     return 1
 }
 
-root_qdisc_kind() {
+root_qdisc_line() {
     local device=$1
-    tc qdisc show dev "$device" 2>/dev/null | awk '$0 ~ / root / { print $2; exit }'
+    tc qdisc show dev "$device" 2>/dev/null | awk '$0 ~ / root / { print; exit }'
 }
 
 owner_value() {
@@ -227,14 +289,19 @@ owner_value() {
 
 assert_safe_root_qdisc() {
     local device=$1
-    local kind owner_interface
-    kind=$(root_qdisc_kind "$device")
+    local line kind handle owner_interface
+    line=$(root_qdisc_line "$device")
+    kind=$(awk '{ print $2 }' <<<"$line")
+    handle=$(awk '{ print $3 }' <<<"$line")
 
     case "$kind" in
-        ""|noqueue|mq|fq|fq_codel|pfifo_fast) return 0 ;;
+        "") return 0 ;;
+        noqueue|mq|fq|fq_codel|pfifo_fast)
+            [[ "$handle" == "0:" ]] && return 0
+            ;;
         htb)
             owner_interface=$(owner_value INTERFACE 2>/dev/null || true)
-            [[ "$owner_interface" == "$device" ]] && return 0
+            [[ "$owner_interface" == "$device" && "$line" == "qdisc htb 1: root"* ]] && return 0
             ;;
     esac
 
@@ -256,26 +323,35 @@ write_owner_file() {
 setup_network() {
     local device=$1
     local created_clsact=0
+    local previous_owner previous_created_clsact
 
     mkdir -p "$STATE_DIR"
     assert_safe_root_qdisc "$device"
+    previous_owner=$(owner_value INTERFACE 2>/dev/null || true)
+    if tc filter show dev "$device" ingress pref "$REDIRECT_PREF" 2>/dev/null | grep -q .; then
+        [[ "$previous_owner" == "$device" ]] || die "Ingress filter priority $REDIRECT_PREF is already in use on $device"
+    fi
+    previous_created_clsact=$(owner_value CREATED_CLSACT 2>/dev/null || printf '0')
 
     if ip link show dev "$IFB_NAME" >/dev/null 2>&1; then
         local owned_ifb
         owned_ifb=$(owner_value IFB_NAME 2>/dev/null || true)
         [[ "$owned_ifb" == "$IFB_NAME" ]] || die "IFB device already exists and is not owned by IPLimit: $IFB_NAME"
-    else
+    fi
+
+    write_owner_file "$device" "$previous_created_clsact"
+    NETWORK_TOUCHED=1
+    if ! ip link show dev "$IFB_NAME" >/dev/null 2>&1; then
         modprobe ifb 2>/dev/null || true
         ip link add "$IFB_NAME" type ifb
     fi
     ip link set dev "$IFB_NAME" up
-    write_owner_file "$device" "0"
 
     if ! tc qdisc show dev "$device" | grep -q '^qdisc clsact '; then
         tc qdisc add dev "$device" clsact
         created_clsact=1
     else
-        created_clsact=$(owner_value CREATED_CLSACT 2>/dev/null || printf '0')
+        created_clsact=$previous_created_clsact
     fi
 
     write_owner_file "$device" "$created_clsact"
@@ -298,19 +374,26 @@ cleanup_network() {
     local device=${1:-}
     local owned_device owned_ifb created_clsact
 
+    if [[ ! -f "$OWNER_FILE" ]]; then
+        NETWORK_TOUCHED=0
+        return 0
+    fi
+
     if [[ -z "$device" ]]; then
         owned_device=$(owner_value INTERFACE 2>/dev/null || true)
         device=$owned_device
     fi
-    owned_ifb=$(owner_value IFB_NAME 2>/dev/null || printf '%s' "$IFB_NAME")
+    owned_ifb=$(owner_value IFB_NAME 2>/dev/null || true)
     created_clsact=$(owner_value CREATED_CLSACT 2>/dev/null || printf '0')
 
     if [[ -n "$device" ]] && ip link show dev "$device" >/dev/null 2>&1; then
         tc filter del dev "$device" ingress pref "$REDIRECT_PREF" 2>/dev/null || true
-        if [[ $(root_qdisc_kind "$device") == "htb" ]]; then
+        if [[ $(owner_value INTERFACE 2>/dev/null || true) == "$device" && $(root_qdisc_line "$device") == "qdisc htb 1: root"* ]]; then
             tc qdisc del dev "$device" root 2>/dev/null || true
         fi
-        if [[ "$created_clsact" == "1" ]] && ! tc filter show dev "$device" ingress 2>/dev/null | grep -q .; then
+        if [[ "$created_clsact" == "1" ]] \
+            && ! tc filter show dev "$device" ingress 2>/dev/null | grep -q . \
+            && ! tc filter show dev "$device" egress 2>/dev/null | grep -q .; then
             tc qdisc del dev "$device" clsact 2>/dev/null || true
         fi
     fi
@@ -323,6 +406,7 @@ cleanup_network() {
 
     rm -f "$OWNER_FILE" "$CLIENTS_FILE"
     rmdir "$STATE_DIR" 2>/dev/null || true
+    NETWORK_TOUCHED=0
 }
 
 local_addresses() {
@@ -396,12 +480,18 @@ daemon_main() {
         [[ "$shutdown_done" == "1" ]] && return
         shutdown_done=1
         trap - EXIT INT TERM
-        cleanup_network "$device"
+        if [[ "$NETWORK_TOUCHED" == "1" ]]; then
+            cleanup_network "$device"
+        fi
     }
     trap 'daemon_shutdown; exit 0' INT TERM
     trap 'daemon_shutdown' EXIT
 
     setup_network "$device"
+
+    if [[ -n ${NOTIFY_SOCKET:-} ]]; then
+        systemd-notify --ready --status="Shaping ${RATE_MBIT} Mbps per client on $device"
+    fi
 
     # These maps live only for one daemon generation; setup_network rebuilds tc state.
     declare -A ip_class=()
@@ -477,7 +567,8 @@ start_limit() {
     save_config
 
     systemctl daemon-reload
-    systemctl enable --now "$SERVICE_NAME"
+    systemctl enable "$SERVICE_NAME"
+    systemctl restart "$SERVICE_NAME"
     systemctl is-active --quiet "$SERVICE_NAME" || die "Service failed to start; inspect: journalctl -u $SERVICE_NAME -n 100 --no-pager"
     log "started: ${RATE_MBIT} Mbps per client (interface: $INTERFACE)"
 }

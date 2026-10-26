@@ -20,8 +20,8 @@ Run on Debian 12 as root:
 curl -fsSL https://raw.githubusercontent.com/sakz/iplimit/main/install.sh | sudo bash
 ```
 
-The installer installs `bash`, `iproute2`, `conntrack`, and `kmod`, then places
-the command at `/usr/local/bin/iplimit`.
+The installer installs `bash`, `iproute2`, `conntrack`, `kmod`, and `systemd`,
+then places the command at `/usr/local/bin/iplimit`.
 
 You can also install from a clone:
 
