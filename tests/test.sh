@@ -109,4 +109,13 @@ assert_success "systemd waits for daemon readiness" grep -q '^Type=notify$' "$IN
 assert_success "installer creates default config" test -f "$INSTALL_ROOT/etc/iplimit.conf"
 assert_success "installed command has valid syntax" bash -n "$INSTALL_ROOT/usr/local/bin/iplimit"
 
+PIPE_INSTALL_ROOT=$(mktemp -d)
+trap 'rm -rf "$INSTALL_ROOT" "$PIPE_INSTALL_ROOT"' EXIT
+PIPE_INSTALL_OUTPUT=$(
+    cd "$ROOT_DIR"
+    DESTDIR="$PIPE_INSTALL_ROOT" SKIP_DEPENDENCIES=1 bash <install.sh 2>&1
+)
+assert_success "piped installer creates executable command" test -x "$PIPE_INSTALL_ROOT/usr/local/bin/iplimit"
+assert_failure "piped installer has no unbound-variable warning" grep -q 'unbound variable' <<<"$PIPE_INSTALL_OUTPUT"
+
 printf '\n%d tests passed\n' "$PASS_COUNT"
