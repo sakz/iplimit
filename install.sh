@@ -6,7 +6,7 @@ readonly REPO_SLUG="${IPLIMIT_REPO:-sakz/iplimit}"
 readonly REPO_REF="${IPLIMIT_REF:-main}"
 readonly RAW_BASE="https://raw.githubusercontent.com/${REPO_SLUG}/${REPO_REF}"
 readonly DESTDIR="${DESTDIR:-}"
-SCRIPT_PATH=${BASH_SOURCE[0]:-$0}
+SCRIPT_PATH=$0
 SCRIPT_DIR=$(cd "$(dirname "$SCRIPT_PATH")" && pwd)
 readonly SCRIPT_DIR
 INSTALL_WORK_DIR=""
