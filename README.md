@@ -7,7 +7,7 @@ independent upload and download ceiling without using packet-drop rate limiting.
 - TCP and UDP, IPv4 and IPv6
 - Automatic client discovery through conntrack
 - Independent HTB class per client IP
-- Upload shaping through IFB; download shaping on the public interface
+- Upload shaping through selective per-client IFB redirects; download shaping on the public interface
 - Interactive menu and command-line operation
 - Safe cleanup of IPLimit-owned rules
 - Unmatched traffic uses a high-rate default class instead of being blocked
@@ -75,9 +75,39 @@ editing the file, apply it with `sudo iplimit start`.
 ## How it works
 
 For downloads, packets leave the VPS with the client as the destination, so
-IPLimit classifies WAN egress by destination IP. For uploads, it redirects WAN
-ingress to an IFB and classifies by source IP. Each address gets separate HTB
-classes in both directions; `fq_codel` manages the queue inside each class.
+IPLimit classifies WAN egress by destination IP. For uploads, it installs a
+source-IP ingress filter after discovering a client and redirects only that
+client's packets to IFB. Website responses and other unrelated ingress traffic
+bypass IFB. Each address gets separate HTB classes in both directions;
+`fq_codel` manages the queue inside each class.
+
+IPv4 clients share one exact-match flower priority and IPv6 clients share a
+second priority. Each client retains its own filter handle and HTB class. This
+avoids a priority chain that grows linearly with the number of clients.
+
+## CPU usage and upgrading from 1.0.0
+
+Version 1.0.0 redirected every ingress packet to IFB, including website
+responses received by the proxy. On high-throughput or high-PPS servers that
+could produce heavy `ksoftirqd` CPU usage. Version 1.1.0 redirects only upload
+packets from discovered client IPs.
+
+Upgrade and restart the active service with the same one-command installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sakz/iplimit/main/install.sh | sudo bash
+```
+
+Compare CPU and traffic-control counters before and after upgrading:
+
+```bash
+mpstat -P ALL 1
+sudo tc -s filter show dev eth0 ingress
+sudo tc -s class show dev ifb-iplimit
+sudo journalctl -u iplimit.service -n 100 --no-pager
+```
+
+Replace `eth0` with the interface shown by `sudo iplimit status`.
 
 The daemon reads the original direction of conntrack entries whose destination
 is a global address on the selected interface. That distinguishes inbound
@@ -99,7 +129,8 @@ client's configured ceiling.
   connections are not deliberately dropped, but always keep a second console
   available when changing remote networking.
 - Per-IP classes are created after the daemon observes a conntrack entry. The
-  first few packets before the next poll use the unshaped default class.
+  first few packets before the next poll are unshaped; unrelated ingress traffic
+  never enters IFB.
 
 ## Troubleshooting
 

@@ -84,6 +84,8 @@ assert_eq 'ip|dst_ip|198.51.100.7/32' "$(filter_spec download 198.51.100.7)" "bu
 assert_eq 'ip|src_ip|198.51.100.7/32' "$(filter_spec upload 198.51.100.7)" "builds IPv4 upload classifier"
 assert_eq 'ipv6|dst_ip|2001:db8::7/128' "$(filter_spec download 2001:db8::7)" "builds IPv6 download classifier"
 assert_eq 'ipv6|src_ip|2001:db8::7/128' "$(filter_spec upload 2001:db8::7)" "builds IPv6 upload classifier"
+assert_eq '49150' "$(filter_pref ip)" "IPv4 clients share one flower priority"
+assert_eq '49151' "$(filter_pref ipv6)" "IPv6 clients share one flower priority"
 
 APPLY_OUTPUT=$(
     require_root() { :; }
@@ -117,5 +119,19 @@ PIPE_INSTALL_OUTPUT=$({
 } 2>&1)
 assert_success "piped installer creates executable command" test -x "$PIPE_INSTALL_ROOT/usr/local/bin/iplimit"
 assert_failure "piped installer has no unbound-variable warning" grep -q 'unbound variable' <<<"$PIPE_INSTALL_OUTPUT"
+assert_success "installer completion message is Chinese" grep -q '已安装到' <<<"$PIPE_INSTALL_OUTPUT"
+
+HELP_OUTPUT=$(env -u IPLIMIT_LIBRARY_ONLY "$ROOT_DIR/iplimit" help)
+assert_success "help uses a Chinese usage heading" grep -q '用法：' <<<"$HELP_OUTPUT"
+assert_success "help describes the interactive menu in Chinese" grep -q '打开交互式菜单' <<<"$HELP_OUTPUT"
+
+UNKNOWN_OUTPUT_FILE=$(mktemp)
+if env -u IPLIMIT_LIBRARY_ONLY "$ROOT_DIR/iplimit" unknown-command >"$UNKNOWN_OUTPUT_FILE" 2>&1; then
+    fail "unknown command must return a failure"
+else
+    pass "unknown command returns a failure"
+fi
+assert_success "unknown-command error is Chinese" grep -q '未知命令' "$UNKNOWN_OUTPUT_FILE"
+rm -f "$UNKNOWN_OUTPUT_FILE"
 
 printf '\n%d tests passed\n' "$PASS_COUNT"

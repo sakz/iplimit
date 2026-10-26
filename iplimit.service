@@ -1,5 +1,5 @@
 [Unit]
-Description=IPLimit per-client traffic shaping
+Description=IPLimit 按客户端 IP 独立限速
 Documentation=https://github.com/sakz/iplimit
 After=network-online.target
 Wants=network-online.target

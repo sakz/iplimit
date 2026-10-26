@@ -15,8 +15,15 @@ jobs:
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Check Bash syntax
-        run: bash -n iplimit install.sh tests/test.sh
+        run: bash -n iplimit install.sh tests/test.sh tests/test_tc_integration.sh
       - name: Run ShellCheck
-        run: shellcheck iplimit install.sh tests/test.sh
+        run: shellcheck iplimit install.sh tests/test.sh tests/test_tc_integration.sh
       - name: Run tests
         run: bash tests/test.sh
+      - name: Run Debian traffic-control integration tests
+        run: |
+          docker run --rm --privileged -v "$PWD:/src:ro" debian:12-slim bash -lc '
+            apt-get update >/dev/null &&
+            apt-get install -y --no-install-recommends bash iproute2 conntrack kmod systemd iputils-ping >/dev/null &&
+            bash /src/tests/test_tc_integration.sh
+          '

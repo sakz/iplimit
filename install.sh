@@ -12,11 +12,11 @@ readonly SCRIPT_DIR
 INSTALL_WORK_DIR=""
 
 log() {
-    printf '[iplimit installer] %s\n' "$*"
+    printf '[iplimit 安装器] %s\n' "$*"
 }
 
 die() {
-    printf '[iplimit installer] ERROR: %s\n' "$*" >&2
+    printf '[iplimit 安装器] 错误：%s\n' "$*" >&2
     exit 1
 }
 
@@ -31,14 +31,14 @@ fetch_file() {
     elif command -v wget >/dev/null 2>&1; then
         wget -qO "$destination" "$RAW_BASE/$name"
     else
-        die "curl or wget is required to download $name"
+        die "下载 $name 需要 curl 或 wget"
     fi
 }
 
 install_dependencies() {
     [[ ${SKIP_DEPENDENCIES:-0} == "1" ]] && return
-    command -v apt-get >/dev/null 2>&1 || die "This installer supports Debian/Ubuntu systems with apt-get"
-    log "installing dependencies (bash, iproute2, conntrack, kmod, systemd)"
+    command -v apt-get >/dev/null 2>&1 || die "安装器仅支持使用 apt-get 的 Debian/Ubuntu 系统"
+    log "正在安装依赖（bash、iproute2、conntrack、kmod、systemd）"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends bash iproute2 conntrack kmod systemd ca-certificates
@@ -55,7 +55,7 @@ atomic_install() {
 
 main() {
     if [[ -z "$DESTDIR" && $(id -u) -ne 0 ]]; then
-        die "Run the installer as root, for example: curl ... | sudo bash"
+        die "请使用 root 权限运行，例如：curl ... | sudo bash"
     fi
 
     install_dependencies
@@ -76,7 +76,7 @@ main() {
 
     if [[ ! -e "$config_dir/iplimit.conf" ]]; then
         cat >"$config_dir/iplimit.conf" <<'EOF'
-# Managed by iplimit. Edit values, then run: sudo iplimit start
+# 由 iplimit 管理。修改后请运行：sudo iplimit start
 RATE_MBIT="20"
 INTERFACE="auto"
 IFB_NAME="ifb-iplimit"
@@ -92,13 +92,13 @@ EOF
         systemctl daemon-reload
         if systemctl is-active --quiet iplimit.service; then
             systemctl restart iplimit.service
-            log "upgraded and restarted the active service"
+            log "已升级并重启正在运行的服务"
         fi
     fi
 
-    log "installed /usr/local/bin/iplimit"
-    log "run: sudo iplimit"
-    log "or start directly: sudo iplimit start 20"
+    log "已安装到 /usr/local/bin/iplimit"
+    log "运行交互式菜单：sudo iplimit"
+    log "或直接启动：sudo iplimit start 20"
 }
 
 main "$@"

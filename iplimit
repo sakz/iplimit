@@ -3,13 +3,15 @@
 set -Eeuo pipefail
 
 readonly PROGRAM_NAME="iplimit"
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly CONFIG_FILE="${IPLIMIT_CONFIG_FILE:-/etc/iplimit.conf}"
 readonly STATE_DIR="${IPLIMIT_STATE_DIR:-/run/iplimit}"
 readonly OWNER_FILE="$STATE_DIR/owner.env"
 readonly CLIENTS_FILE="$STATE_DIR/clients.tsv"
 readonly SERVICE_NAME="iplimit.service"
-readonly REDIRECT_PREF="49152"
+readonly IPV4_FILTER_PREF="49150"
+readonly IPV6_FILTER_PREF="49151"
+readonly LEGACY_REDIRECT_PREF="49152"
 
 RATE_MBIT="20"
 INTERFACE="auto"
@@ -25,11 +27,11 @@ log() {
 }
 
 warn() {
-    printf '[%s] WARNING: %s\n' "$PROGRAM_NAME" "$*" >&2
+    printf '[%s] 警告：%s\n' "$PROGRAM_NAME" "$*" >&2
 }
 
 die() {
-    printf '[%s] ERROR: %s\n' "$PROGRAM_NAME" "$*" >&2
+    printf '[%s] 错误：%s\n' "$PROGRAM_NAME" "$*" >&2
     exit 1
 }
 
@@ -174,68 +176,77 @@ filter_spec() {
     printf '%s|%s|%s/%s\n' "$protocol" "$key" "$ip" "$suffix"
 }
 
+filter_pref() {
+    local protocol=${1:-}
+    case "$protocol" in
+        ip) printf '%s\n' "$IPV4_FILTER_PREF" ;;
+        ipv6) printf '%s\n' "$IPV6_FILTER_PREF" ;;
+        *) return 1 ;;
+    esac
+}
+
 usage() {
     cat <<'EOF'
-IPLimit - Debian 12 per-client traffic shaping
+IPLimit - Debian 12 按客户端 IP 独立限速工具
 
-Usage:
-  iplimit                         Open the interactive menu
-  iplimit start [Mbps] [iface]    Start or update shaping (defaults: 20, auto)
-  iplimit set <Mbps>              Change the per-client limit and restart
-  iplimit status                  Show service, qdisc, and configuration status
-  iplimit clients                 Show discovered client IPs and class IDs
-  iplimit stop                    Stop shaping and remove owned tc/IFB state
-  iplimit help                    Show this help
-  iplimit version                 Show the installed version
+用法：
+  iplimit                         打开交互式菜单
+  iplimit start [Mbps] [网卡]      启动或更新限速（默认：20、自动识别网卡）
+  iplimit set <Mbps>              修改每个客户端的限速并重启服务
+  iplimit status                  查看服务、队列和配置状态
+  iplimit clients                 查看已发现的客户端 IP 和类别 ID
+  iplimit stop                    停止限速并清理本工具创建的 tc/IFB 配置
+  iplimit help                    显示帮助
+  iplimit version                 显示版本
 
-Examples:
+示例：
   sudo iplimit start 20
   sudo iplimit start 12.5 eth0
   sudo iplimit set 50
   sudo iplimit status
 
-The limit is independent for every directly connected client IP and applies to
-both TCP and UDP, upload and download. Unmatched traffic uses an unshaped class.
+每个直连客户端 IP 都有独立的上传和下载上限，支持 TCP、UDP、IPv4 和 IPv6。
+未识别的流量不会进入 IFB，也不会被限速。
 EOF
 }
 
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
-        # This is a root-managed file containing only simple variable assignments.
+        # 该文件由 root 管理，只包含简单变量赋值。
         # shellcheck disable=SC1090
         source "$CONFIG_FILE"
     fi
 }
 
 validate_config() {
-    is_valid_rate "$RATE_MBIT" || die "RATE_MBIT must be a positive number, got: $RATE_MBIT"
-    is_positive_integer "$POLL_INTERVAL" || die "POLL_INTERVAL must be a positive integer"
-    is_positive_integer "$CLIENT_TTL" || die "CLIENT_TTL must be a positive integer"
-    is_valid_rate "$UNSHAPED_RATE_MBIT" || die "UNSHAPED_RATE_MBIT must be a positive number"
-    [[ "$INTERFACE" == "auto" ]] || is_valid_interface_name "$INTERFACE" || die "Invalid interface name (maximum 15 characters): $INTERFACE"
-    is_valid_interface_name "$IFB_NAME" || die "Invalid IFB name (maximum 15 characters): $IFB_NAME"
+    is_valid_rate "$RATE_MBIT" || die "RATE_MBIT 必须是正数，当前值：$RATE_MBIT"
+    is_positive_integer "$POLL_INTERVAL" || die "POLL_INTERVAL 必须是正整数"
+    is_positive_integer "$CLIENT_TTL" || die "CLIENT_TTL 必须是正整数"
+    is_valid_rate "$UNSHAPED_RATE_MBIT" || die "UNSHAPED_RATE_MBIT 必须是正数"
+    [[ "$INTERFACE" == "auto" ]] || is_valid_interface_name "$INTERFACE" || die "网卡名称无效（最长 15 个字符）：$INTERFACE"
+    is_valid_interface_name "$IFB_NAME" || die "IFB 名称无效（最长 15 个字符）：$IFB_NAME"
 
     local ip
     for ip in $EXCLUDE_IPS; do
-        is_ip_address "$ip" || die "Invalid address in EXCLUDE_IPS: $ip"
+        is_ip_address "$ip" || die "EXCLUDE_IPS 中的地址无效：$ip"
     done
 }
 
 require_root() {
-    [[ $(id -u) -eq 0 ]] || die "This command requires root; run it with sudo"
+    [[ $(id -u) -eq 0 ]] || die "此命令需要 root 权限，请使用 sudo 运行"
 }
 
 require_commands() {
     local command_name
     for command_name in ip tc conntrack modprobe systemctl systemd-notify awk sort; do
-        command -v "$command_name" >/dev/null 2>&1 || die "Missing dependency: $command_name (rerun install.sh)"
+        command -v "$command_name" >/dev/null 2>&1 || die "缺少依赖：${command_name}（请重新运行 install.sh）"
     done
 }
 
 detect_interface() {
     local detected
     if [[ "$INTERFACE" != "auto" ]]; then
-        ip link show dev "$INTERFACE" >/dev/null 2>&1 || die "Interface does not exist: $INTERFACE"
+        ip link show dev "$INTERFACE" >/dev/null 2>&1 || die "网卡不存在：$INTERFACE"
         printf '%s\n' "$INTERFACE"
         return
     fi
@@ -244,7 +255,7 @@ detect_interface() {
     if [[ -z "$detected" ]]; then
         detected=$(ip -6 route show default 2>/dev/null | awk '/^default/ { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
     fi
-    [[ -n "$detected" ]] || die "Could not detect the default network interface; pass it to: iplimit start <Mbps> <iface>"
+    [[ -n "$detected" ]] || die "无法识别默认网卡，请手动指定：iplimit start <Mbps> <网卡>"
     printf '%s\n' "$detected"
 }
 
@@ -255,7 +266,7 @@ save_config() {
     tmp=$(mktemp "$target_dir/.iplimit.conf.XXXXXX")
     chmod 600 "$tmp"
     {
-        printf '# Managed by iplimit. Edit values, then run: sudo iplimit start\n'
+        printf '# 由 iplimit 管理。修改后请运行：sudo iplimit start\n'
         printf 'RATE_MBIT="%s"\n' "$RATE_MBIT"
         printf 'INTERFACE="%s"\n' "$INTERFACE"
         printf 'IFB_NAME="%s"\n' "$IFB_NAME"
@@ -305,7 +316,7 @@ assert_safe_root_qdisc() {
             ;;
     esac
 
-    die "Refusing to replace existing root qdisc '$kind' on $device. Remove or migrate that tc configuration first."
+    die "拒绝替换 $device 上已有的根队列 '$kind'，请先移除或迁移现有 tc 配置"
 }
 
 write_owner_file() {
@@ -316,27 +327,59 @@ write_owner_file() {
         printf 'INTERFACE=%s\n' "$device"
         printf 'IFB_NAME=%s\n' "$IFB_NAME"
         printf 'CREATED_CLSACT=%s\n' "$created_clsact"
+        printf 'RULESET_VERSION=2\n'
     } >"$tmp"
     mv -f "$tmp" "$OWNER_FILE"
+}
+
+legacy_redirect_matches() {
+    local device=$1
+    local expected_ifb=$2
+    local rules
+    rules=$(tc filter show dev "$device" ingress pref "$LEGACY_REDIRECT_PREF" 2>/dev/null) || return 1
+    grep -q 'matchall' <<<"$rules" \
+        && grep -Fq "mirred (Egress Redirect to device $expected_ifb)" <<<"$rules"
 }
 
 setup_network() {
     local device=$1
     local created_clsact=0
-    local previous_owner previous_created_clsact
+    local previous_owner previous_created_clsact previous_ruleset
+    local reclaim_new_filters=0
+    local reclaim_legacy_filter=0
 
     mkdir -p "$STATE_DIR"
     assert_safe_root_qdisc "$device"
     previous_owner=$(owner_value INTERFACE 2>/dev/null || true)
-    if tc filter show dev "$device" ingress pref "$REDIRECT_PREF" 2>/dev/null | grep -q .; then
-        [[ "$previous_owner" == "$device" ]] || die "Ingress filter priority $REDIRECT_PREF is already in use on $device"
+    previous_ruleset=$(owner_value RULESET_VERSION 2>/dev/null || true)
+    if tc filter show dev "$device" ingress pref "$IPV4_FILTER_PREF" 2>/dev/null | grep -q . \
+        || tc filter show dev "$device" ingress pref "$IPV6_FILTER_PREF" 2>/dev/null | grep -q .; then
+        if [[ "$previous_owner" == "$device" && "$previous_ruleset" == "2" ]]; then
+            reclaim_new_filters=1
+        else
+            die "$device 的入口过滤器优先级 $IPV4_FILTER_PREF/$IPV6_FILTER_PREF 已被占用"
+        fi
+    fi
+    if [[ "$previous_owner" == "$device" && -z "$previous_ruleset" ]] \
+        && legacy_redirect_matches "$device" "$IFB_NAME"; then
+        reclaim_legacy_filter=1
     fi
     previous_created_clsact=$(owner_value CREATED_CLSACT 2>/dev/null || printf '0')
 
     if ip link show dev "$IFB_NAME" >/dev/null 2>&1; then
         local owned_ifb
         owned_ifb=$(owner_value IFB_NAME 2>/dev/null || true)
-        [[ "$owned_ifb" == "$IFB_NAME" ]] || die "IFB device already exists and is not owned by IPLimit: $IFB_NAME"
+        [[ "$owned_ifb" == "$IFB_NAME" ]] || die "IFB 设备已存在且不属于 IPLimit：$IFB_NAME"
+    fi
+
+    if [[ "$reclaim_new_filters" == "1" ]]; then
+        NETWORK_TOUCHED=1
+        tc filter del dev "$device" ingress pref "$IPV4_FILTER_PREF" protocol ip 2>/dev/null || true
+        tc filter del dev "$device" ingress pref "$IPV6_FILTER_PREF" protocol ipv6 2>/dev/null || true
+    fi
+    if [[ "$reclaim_legacy_filter" == "1" ]]; then
+        NETWORK_TOUCHED=1
+        tc filter del dev "$device" ingress pref "$LEGACY_REDIRECT_PREF" protocol all 2>/dev/null || true
     fi
 
     write_owner_file "$device" "$previous_created_clsact"
@@ -356,9 +399,6 @@ setup_network() {
 
     write_owner_file "$device" "$created_clsact"
 
-    tc filter replace dev "$device" ingress pref "$REDIRECT_PREF" protocol all \
-        matchall action mirred egress redirect dev "$IFB_NAME"
-
     tc qdisc replace dev "$device" root handle 1: htb default 1
     tc class replace dev "$device" parent 1: classid 1:1 htb \
         rate "${UNSHAPED_RATE_MBIT}mbit" ceil "${UNSHAPED_RATE_MBIT}mbit" quantum 15140
@@ -372,7 +412,7 @@ setup_network() {
 
 cleanup_network() {
     local device=${1:-}
-    local owned_device owned_ifb created_clsact
+    local owned_device owned_ifb created_clsact ruleset_version
 
     if [[ ! -f "$OWNER_FILE" ]]; then
         NETWORK_TOUCHED=0
@@ -385,9 +425,15 @@ cleanup_network() {
     fi
     owned_ifb=$(owner_value IFB_NAME 2>/dev/null || true)
     created_clsact=$(owner_value CREATED_CLSACT 2>/dev/null || printf '0')
+    ruleset_version=$(owner_value RULESET_VERSION 2>/dev/null || true)
 
     if [[ -n "$device" ]] && ip link show dev "$device" >/dev/null 2>&1; then
-        tc filter del dev "$device" ingress pref "$REDIRECT_PREF" 2>/dev/null || true
+        if [[ "$ruleset_version" == "2" ]]; then
+            tc filter del dev "$device" ingress pref "$IPV4_FILTER_PREF" protocol ip 2>/dev/null || true
+            tc filter del dev "$device" ingress pref "$IPV6_FILTER_PREF" protocol ipv6 2>/dev/null || true
+        elif [[ -z "$ruleset_version" ]] && legacy_redirect_matches "$device" "$owned_ifb"; then
+            tc filter del dev "$device" ingress pref "$LEGACY_REDIRECT_PREF" protocol all 2>/dev/null || true
+        fi
         if [[ $(owner_value INTERFACE 2>/dev/null || true) == "$device" && $(root_qdisc_line "$device") == "qdisc htb 1: root"* ]]; then
             tc qdisc del dev "$device" root 2>/dev/null || true
         fi
@@ -426,40 +472,59 @@ add_client_class() {
     local device=$1
     local ip=$2
     local class_num=$3
-    local class_hex protocol download_key download_cidr upload_key upload_cidr
+    local class_hex filter_handle filter_priority protocol download_key download_cidr upload_key upload_cidr
     local download_spec upload_spec
 
     class_hex=$(printf '%x' "$class_num")
+    filter_handle="0x$class_hex"
     download_spec=$(filter_spec download "$ip")
     upload_spec=$(filter_spec upload "$ip")
     IFS='|' read -r protocol download_key download_cidr <<<"$download_spec"
     IFS='|' read -r _ upload_key upload_cidr <<<"$upload_spec"
+    filter_priority=$(filter_pref "$protocol")
 
     if ! tc class add dev "$device" parent 1: classid "1:$class_hex" htb \
         rate "${RATE_MBIT}mbit" ceil "${RATE_MBIT}mbit" quantum 1514; then
         return 1
     fi
     tc qdisc add dev "$device" parent "1:$class_hex" handle "$class_hex:" fq_codel || return 1
-    tc filter add dev "$device" parent 1: pref "$class_num" protocol "$protocol" flower \
+    tc filter add dev "$device" parent 1: pref "$filter_priority" protocol "$protocol" \
+        handle "$filter_handle" flower \
         "$download_key" "$download_cidr" classid "1:$class_hex" || return 1
 
     tc class add dev "$IFB_NAME" parent 1: classid "1:$class_hex" htb \
         rate "${RATE_MBIT}mbit" ceil "${RATE_MBIT}mbit" quantum 1514 || return 1
     tc qdisc add dev "$IFB_NAME" parent "1:$class_hex" handle "$class_hex:" fq_codel || return 1
-    tc filter add dev "$IFB_NAME" parent 1: pref "$class_num" protocol "$protocol" flower \
+    tc filter add dev "$IFB_NAME" parent 1: pref "$filter_priority" protocol "$protocol" \
+        handle "$filter_handle" flower \
         "$upload_key" "$upload_cidr" classid "1:$class_hex" || return 1
+    tc filter add dev "$device" ingress pref "$filter_priority" protocol "$protocol" \
+        handle "$filter_handle" flower "$upload_key" "$upload_cidr" \
+        action mirred egress redirect dev "$IFB_NAME" || return 1
 }
 
 remove_client_class() {
     local device=$1
-    local class_num=$2
-    local class_hex
+    local ip=$2
+    local class_num=$3
+    local class_hex filter_handle filter_priority protocol
     class_hex=$(printf '%x' "$class_num")
+    filter_handle="0x$class_hex"
+    if [[ "$ip" == *:* ]]; then
+        protocol="ipv6"
+    else
+        protocol="ip"
+    fi
+    filter_priority=$(filter_pref "$protocol")
 
-    tc filter del dev "$device" parent 1: pref "$class_num" 2>/dev/null || true
+    tc filter del dev "$device" ingress pref "$filter_priority" protocol "$protocol" \
+        handle "$filter_handle" flower 2>/dev/null || true
+    tc filter del dev "$device" parent 1: pref "$filter_priority" protocol "$protocol" \
+        handle "$filter_handle" flower 2>/dev/null || true
     tc qdisc del dev "$device" parent "1:$class_hex" 2>/dev/null || true
     tc class del dev "$device" classid "1:$class_hex" 2>/dev/null || true
-    tc filter del dev "$IFB_NAME" parent 1: pref "$class_num" 2>/dev/null || true
+    tc filter del dev "$IFB_NAME" parent 1: pref "$filter_priority" protocol "$protocol" \
+        handle "$filter_handle" flower 2>/dev/null || true
     tc qdisc del dev "$IFB_NAME" parent "1:$class_hex" 2>/dev/null || true
     tc class del dev "$IFB_NAME" classid "1:$class_hex" 2>/dev/null || true
 }
@@ -474,7 +539,7 @@ daemon_main() {
     local shutdown_done=0
     device=$(detect_interface)
     addresses=$(local_addresses "$device")
-    [[ -n "$addresses" ]] || die "No global IP address found on interface: $device"
+    [[ -n "$addresses" ]] || die "网卡 $device 上没有找到全局 IP 地址"
 
     daemon_shutdown() {
         [[ "$shutdown_done" == "1" ]] && return
@@ -490,15 +555,15 @@ daemon_main() {
     setup_network "$device"
 
     if [[ -n ${NOTIFY_SOCKET:-} ]]; then
-        systemd-notify --ready --status="Shaping ${RATE_MBIT} Mbps per client on $device"
+        systemd-notify --ready --status="正在 $device 上按客户端限制为 ${RATE_MBIT} Mbps"
     fi
 
-    # These maps live only for one daemon generation; setup_network rebuilds tc state.
+    # 这些映射只属于当前守护进程；服务重启时会重建 tc 状态。
     declare -A ip_class=()
     declare -A class_ip=()
     declare -A last_seen=()
 
-    log "active on $device: ${RATE_MBIT} Mbps per client in each direction"
+    log "已在 $device 启用：每个客户端每个方向 ${RATE_MBIT} Mbps"
 
     while true; do
         now=$(date +%s)
@@ -515,16 +580,16 @@ daemon_main() {
                     fi
                 done
                 if [[ -z "$class_num" ]]; then
-                    warn "No free tc class ID for client $ip"
+                    warn "没有可供客户端 $ip 使用的 tc 类别 ID"
                     continue
                 fi
                 if add_client_class "$device" "$ip" "$class_num"; then
                     ip_class["$ip"]=$class_num
                     class_ip["$class_num"]=$ip
-                    log "added client $ip as class 1:$(printf '%x' "$class_num")"
+                    log "已添加客户端 ${ip}，类别 1:$(printf '%x' "$class_num")"
                 else
-                    warn "Could not add tc class for client $ip"
-                    remove_client_class "$device" "$class_num"
+                    warn "无法为客户端 $ip 添加 tc 类别"
+                    remove_client_class "$device" "$ip" "$class_num"
                     unset 'last_seen[$ip]'
                 fi
             fi
@@ -533,15 +598,15 @@ daemon_main() {
         for ip in "${!ip_class[@]}"; do
             if ((now - last_seen[$ip] > CLIENT_TTL)); then
                 class_num=${ip_class[$ip]}
-                remove_client_class "$device" "$class_num"
+                remove_client_class "$device" "$ip" "$class_num"
                 unset 'class_ip[$class_num]' 'ip_class[$ip]' 'last_seen[$ip]'
-                log "expired idle client $ip"
+                log "已移除空闲客户端 $ip"
             fi
         done
 
         tmp="$CLIENTS_FILE.tmp.$$"
         {
-            printf 'IP\tCLASS\tLAST_SEEN_EPOCH\n'
+            printf 'IP\t类别\t最后活跃时间戳\n'
             for ip in "${!ip_class[@]}"; do
                 printf '%s\t1:%x\t%s\n' "$ip" "${ip_class[$ip]}" "${last_seen[$ip]}"
             done | sort
@@ -562,19 +627,19 @@ start_limit() {
     if [[ -n ${2:-} ]]; then
         INTERFACE=$2
     fi
-    [[ -z ${3:-} ]] || die "Too many arguments. Usage: iplimit start [Mbps] [iface]"
+    [[ -z ${3:-} ]] || die "参数过多。用法：iplimit start [Mbps] [网卡]"
     validate_config
     save_config
 
     systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME"
+    systemctl enable --quiet "$SERVICE_NAME"
     systemctl restart "$SERVICE_NAME"
-    systemctl is-active --quiet "$SERVICE_NAME" || die "Service failed to start; inspect: journalctl -u $SERVICE_NAME -n 100 --no-pager"
-    log "started: ${RATE_MBIT} Mbps per client (interface: $INTERFACE)"
+    systemctl is-active --quiet "$SERVICE_NAME" || die "服务启动失败，请检查：journalctl -u $SERVICE_NAME -n 100 --no-pager"
+    log "已启动：每个客户端 ${RATE_MBIT} Mbps（网卡：${INTERFACE}）"
 }
 
 set_limit() {
-    [[ -n ${1:-} && -z ${2:-} ]] || die "Usage: iplimit set <Mbps>"
+    [[ -n ${1:-} && -z ${2:-} ]] || die "用法：iplimit set <Mbps>"
     start_limit "$1"
 }
 
@@ -583,7 +648,7 @@ stop_limit() {
     load_config
     systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
     cleanup_network
-    log "stopped; IPLimit-owned tc rules and IFB device were removed"
+    log "已停止，并清理 IPLimit 创建的 tc 规则和 IFB 设备"
 }
 
 show_clients() {
@@ -591,7 +656,7 @@ show_clients() {
     if [[ -f "$CLIENTS_FILE" ]]; then
         column -t -s $'\t' "$CLIENTS_FILE" 2>/dev/null || cat "$CLIENTS_FILE"
     else
-        log "no active client table (the service may be stopped or no poll has completed)"
+        log "暂无客户端记录（服务可能未运行，或尚未完成首次扫描）"
     fi
 }
 
@@ -602,23 +667,29 @@ show_status() {
     local device
     device=$(detect_interface)
 
-    printf 'Service:   '
-    systemctl is-active "$SERVICE_NAME" 2>/dev/null || true
-    printf 'Enabled:   '
-    systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true
-    printf 'Interface: %s\n' "$device"
-    printf 'IFB:       %s\n' "$IFB_NAME"
-    printf 'Limit:     %s Mbps per client, per direction\n' "$RATE_MBIT"
-    printf 'Protocols: IPv4/IPv6, TCP/UDP\n'
-    printf 'Idle TTL:  %s seconds\n' "$CLIENT_TTL"
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        printf '服务状态：运行中\n'
+    else
+        printf '服务状态：未运行\n'
+    fi
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+        printf '开机启动：已启用\n'
+    else
+        printf '开机启动：未启用\n'
+    fi
+    printf '公网网卡：%s\n' "$device"
+    printf 'IFB 设备：%s\n' "$IFB_NAME"
+    printf '限速配置：每个客户端每个方向 %s Mbps\n' "$RATE_MBIT"
+    printf '支持协议：IPv4/IPv6、TCP/UDP\n'
+    printf '空闲清理：%s 秒\n' "$CLIENT_TTL"
 
-    printf '\nRoot qdisc on %s:\n' "$device"
+    printf '\n%s 上的根队列：\n' "$device"
     tc qdisc show dev "$device" 2>/dev/null || true
     if ip link show dev "$IFB_NAME" >/dev/null 2>&1; then
-        printf '\nRoot qdisc on %s:\n' "$IFB_NAME"
+        printf '\n%s 上的根队列：\n' "$IFB_NAME"
         tc qdisc show dev "$IFB_NAME" 2>/dev/null || true
     fi
-    printf '\nClients:\n'
+    printf '\n客户端：\n'
     show_clients
 }
 
@@ -628,18 +699,18 @@ interactive_menu() {
         cat <<'EOF'
 
 IPLimit
-  1) Start or change the per-client limit
-  2) Show status
-  3) Show active clients
-  4) Stop and clean up
-  5) Exit
+  1) 启动或修改每个客户端的限速
+  2) 查看状态
+  3) 查看活跃客户端
+  4) 停止并清理
+  5) 退出
 EOF
-        read -r -p "Choose [1-5]: " choice
+        read -r -p "请选择 [1-5]：" choice
         case "$choice" in
             1)
-                read -r -p "Per-client Mbps [20]: " rate
+                read -r -p "每个客户端的限速 Mbps [20]：" rate
                 rate=${rate:-20}
-                read -r -p "Network interface [auto]: " iface
+                read -r -p "公网网卡 [auto]：" iface
                 iface=${iface:-auto}
                 start_limit "$rate" "$iface"
                 ;;
@@ -647,7 +718,7 @@ EOF
             3) show_clients ;;
             4) stop_limit ;;
             5) return 0 ;;
-            *) warn "Choose a number from 1 to 5" ;;
+            *) warn "请输入 1 到 5 之间的数字" ;;
         esac
     done
 }
@@ -661,14 +732,14 @@ main() {
         "") interactive_menu ;;
         start) start_limit "$@" ;;
         set) set_limit "$@" ;;
-        status) [[ $# -eq 0 ]] || die "Usage: iplimit status"; show_status ;;
-        clients) [[ $# -eq 0 ]] || die "Usage: iplimit clients"; show_clients ;;
-        stop|clean) [[ $# -eq 0 ]] || die "Usage: iplimit stop"; stop_limit ;;
+        status) [[ $# -eq 0 ]] || die "用法：iplimit status"; show_status ;;
+        clients) [[ $# -eq 0 ]] || die "用法：iplimit clients"; show_clients ;;
+        stop|clean) [[ $# -eq 0 ]] || die "用法：iplimit stop"; stop_limit ;;
         help|-h|--help) usage ;;
         version|-V|--version) printf '%s %s\n' "$PROGRAM_NAME" "$VERSION" ;;
-        daemon-internal) [[ $# -eq 0 ]] || die "Invalid daemon arguments"; daemon_main ;;
-        cleanup-internal) [[ $# -eq 0 ]] || die "Invalid cleanup arguments"; require_root; load_config; cleanup_network ;;
-        *) die "Unknown command: $command (run: iplimit help)" ;;
+        daemon-internal) [[ $# -eq 0 ]] || die "守护进程参数无效"; daemon_main ;;
+        cleanup-internal) [[ $# -eq 0 ]] || die "清理参数无效"; require_root; load_config; cleanup_network ;;
+        *) die "未知命令：${command}（请运行 iplimit help 查看帮助）" ;;
     esac
 }
 
